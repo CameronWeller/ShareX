@@ -138,36 +138,43 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Sign ShareX binaries
+      - name: Collect unsigned binaries
+        id: signing-files
         if: >-
           (github.ref == 'refs/heads/develop' && matrix.configuration == 'Release') ||
           (startsWith(github.ref, 'refs/tags/v') &&
           (matrix.configuration == 'Release' || matrix.configuration == 'Steam' || matrix.configuration == 'MicrosoftStore'))
+        run: |
+          # ReadyToRun rewrites dependencies too, removing their original Authenticode signatures.
+          # Preserve valid upstream signatures and sign every unsigned binary that will be packaged.
+          $outputPath = "${{ github.workspace }}\ShareX\bin\${{ matrix.configuration }}\${{ env.RUNTIME_ID }}"
+          $unsignedFiles = @(Get-ChildItem -Path $outputPath -Recurse -File -Include *.exe,*.dll |
+            Where-Object { (Get-AuthenticodeSignature -LiteralPath $_.FullName).Status -eq 'NotSigned' })
+          @('files<<SIGNING_FILES') + $unsignedFiles.FullName + 'SIGNING_FILES' |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Sign unsigned binaries
+        if: steps.signing-files.outputs.files != ''
         uses: azure/artifact-signing-action@v2
         with:
           endpoint: ${{ vars.SIGNING_ENDPOINT }}
           signing-account-name: ${{ vars.SIGNING_ACCOUNT_NAME }}
           certificate-profile-name: ${{ vars.CERTIFICATE_PROFILE_NAME }}
-          files-folder: ${{ github.workspace }}\ShareX\bin\${{ matrix.configuration }}\${{ env.RUNTIME_ID }}
-          files-folder-filter: ShareX*.exe,ShareX*.dll,ffmpeg.exe
+          files: ${{ steps.signing-files.outputs.files }}
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
-      - name: Sign Avalonia binaries
-        if: >-
-          startsWith(github.ref, 'refs/tags/v') &&
-          (matrix.configuration == 'Release' || matrix.configuration == 'Steam' || matrix.configuration == 'MicrosoftStore')
-        uses: azure/artifact-signing-action@v2
-        with:
-          endpoint: ${{ vars.SIGNING_ENDPOINT }}
-          signing-account-name: ${{ vars.SIGNING_ACCOUNT_NAME }}
-          certificate-profile-name: ${{ vars.CERTIFICATE_PROFILE_NAME }}
-          files-folder: ${{ github.workspace }}\ShareX\bin\${{ matrix.configuration }}\${{ env.RUNTIME_ID }}
-          files-folder-filter: Avalonia*.dll
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
+      - name: Verify packaged binary signatures
+        if: steps.signing-files.outcome == 'success'
+        run: |
+          $outputPath = "${{ github.workspace }}\ShareX\bin\${{ matrix.configuration }}\${{ env.RUNTIME_ID }}"
+          $invalidSignatures = @(Get-ChildItem -Path $outputPath -Recurse -File -Include *.exe,*.dll |
+            Get-AuthenticodeSignature | Where-Object { $_.Status -ne 'Valid' })
+          if ($invalidSignatures.Count -gt 0) {
+            $invalidSignatures | Format-Table Path, Status, StatusMessage -AutoSize
+            throw "Published binaries must have valid Authenticode signatures before packaging."
+          }
 
       - name: Sign Steam launcher
         if: startsWith(github.ref, 'refs/tags/v') && matrix.configuration == 'Steam'
